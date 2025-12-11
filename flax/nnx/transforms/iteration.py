@@ -1129,6 +1129,7 @@ def scan(
   reverse: bool = False,
   unroll: int | bool = 1,
   _split_transpose: bool = False,
+  segment_length: int | None = None,
   # extended api
   in_axes: int | None | type[Carry] | tuple[tp.Any, ...] = (Carry, 0),
   out_axes: tp.Any = (Carry, 0),
@@ -1146,6 +1147,7 @@ def scan(
   reverse: bool = False,
   unroll: int | bool = 1,
   _split_transpose: bool = False,
+  segment_length: int | None = None,
   # extended api
   in_axes: int | None | type[Carry] | tuple[tp.Any, ...] = (Carry, 0),
   out_axes: tp.Any = (Carry, 0),
@@ -1162,6 +1164,7 @@ def scan(
   reverse: bool = False,
   unroll: int | bool = 1,
   _split_transpose: bool = False,
+  segment_length: int | None = None,
   # extended api
   in_axes: int | None | type[Carry] | tuple[tp.Any, ...] = (Carry, 0),
   out_axes: tp.Any = (Carry, 0),
@@ -1250,6 +1253,12 @@ def scan(
     unroll: optional positive int or bool specifying, in the underlying
       operation of the scan primitive, how many scan iterations to unroll
       within a single iteration of a loop.
+    segment_length: optional integer specifying the segment size for memory-efficient
+      rematerialization. When provided, the scan is split into segments of this size,
+      with checkpointing at segment boundaries. This reduces memory usage from O(n) to
+      O(n/segment_length) for the backward pass, at the cost of recomputing each segment.
+      The total length must be divisible by segment_length. For example, with 48 layers
+      and segment_length=8, only 6 segment boundary states are saved instead of 48.
     in_axes: integer, None, :class:`flax.nnx.Carry` or sequence of values specifying
       the kind of input args. Integer value would specify the axis of corresponding
       input data to scan along. :class:`flax.nnx.Carry` marks the input data as
@@ -1267,6 +1276,7 @@ def scan(
         reverse=reverse,
         unroll=unroll,
         _split_transpose=_split_transpose,
+        segment_length=segment_length,
         in_axes=in_axes,
         out_axes=out_axes,
         transform_metadata=transform_metadata,
@@ -1337,15 +1347,79 @@ def scan(
     carry = (pure_carry_arg, carry_deque, broadcast_deque, broadcast_arrays)
     scan_in = (graphdefs_deque, pure_args)
 
-    carry_out, scan_out = jax.lax.scan(
-      scan_fn,
-      carry,
-      scan_in,
-      length=length,
-      reverse=reverse,
-      unroll=unroll,
-      _split_transpose=_split_transpose,
-    )
+    # Determine actual length for segmented scan validation
+    if length is not None:
+      actual_length = length
+    else:
+      # Infer length from scan_in
+      flat_scan_in = jax.tree.leaves(scan_in)
+      if flat_scan_in:
+        actual_length = flat_scan_in[0].shape[0]
+      else:
+        actual_length = None
+
+    if segment_length is not None and actual_length is not None:
+      # Segmented scan with rematerialization at segment boundaries
+      if actual_length % segment_length != 0:
+        raise ValueError(
+          f'length ({actual_length}) must be divisible by segment_length ({segment_length})'
+        )
+
+      num_segments = actual_length // segment_length
+
+      # Reshape scan_in to add segment dimension: [length, ...] -> [num_segments, segment_length, ...]
+      def reshape_for_segments(x):
+        if isinstance(x, jax.Array) and x.ndim > 0:
+          return x.reshape((num_segments, segment_length) + x.shape[1:])
+        return x
+
+      scan_in_segmented = jax.tree.map(reshape_for_segments, scan_in)
+
+      # Define outer scan over segments
+      def outer_scan_fn(carry, segment_scan_in):
+        # Inner scan within segment - wrapped with remat for memory efficiency
+        @jax.checkpoint
+        def process_segment(c, seg_in):
+          c_out, seg_out = jax.lax.scan(
+            scan_fn, c, seg_in,
+            length=segment_length,
+            reverse=reverse,
+            unroll=unroll,
+            _split_transpose=_split_transpose,
+          )
+          return c_out, seg_out
+
+        carry_out, segment_out = process_segment(carry, segment_scan_in)
+        return carry_out, segment_out
+
+      # Run outer scan over segments
+      carry_out, scan_out_segmented = jax.lax.scan(
+        outer_scan_fn,
+        carry,
+        scan_in_segmented,
+        length=num_segments,
+        reverse=reverse,
+      )
+
+      # Reshape scan_out back to flat form: [num_segments, segment_length, ...] -> [length, ...]
+      def reshape_from_segments(x):
+        if isinstance(x, jax.Array) and x.ndim > 1:
+          return x.reshape((actual_length,) + x.shape[2:])
+        return x
+
+      scan_out = jax.tree.map(reshape_from_segments, scan_out_segmented)
+    else:
+      # Standard scan without segmentation
+      carry_out, scan_out = jax.lax.scan(
+        scan_fn,
+        carry,
+        scan_in,
+        length=length,
+        reverse=reverse,
+        unroll=unroll,
+        _split_transpose=_split_transpose,
+      )
+
     (
         pure_carry_arg_out,
         carry_deque_out,
