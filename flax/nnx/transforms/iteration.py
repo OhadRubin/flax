@@ -1383,8 +1383,9 @@ def scan(
       # Define outer scan over segments
       def outer_scan_fn(carry, segment_scan_in):
         # Inner scan within segment - wrapped with remat for memory efficiency
-        # Use nothing_saveable policy to avoid saving parameters for remat
-        @jax.checkpoint(policy=jax.checkpoint_policies.nothing_saveable)
+        # prevent_cse=False is recommended when checkpoint is used inside scan
+        # (see Linen's remat_scan implementation)
+        @jax.checkpoint(prevent_cse=False)
         def process_segment(c, seg_in):
           c_out, seg_out = jax.lax.scan(
             scan_fn, c, seg_in,
