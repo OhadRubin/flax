@@ -1403,9 +1403,10 @@ def scan(
         return jax.tree.map(slice_array, tree)
 
       # Define inner segment processor ONCE, outside the scan
-      # (following Linen's remat_scan pattern where inner_loop is defined once)
-      # prevent_cse=False is recommended when checkpoint is used inside scan
-      @functools.partial(jax.checkpoint, prevent_cse=False)
+      # NOTE: We don't wrap with jax.checkpoint here because:
+      # 1. The user's scan body (e.g., scan_fn in qwen3.py) already has nnx.remat
+      # 2. Adding checkpoint here would cause params to be saved for recomputation
+      # 3. By not checkpointing, params flow through as regular closed-over values
       def process_segment(carry_and_segment_idx):
         c, segment_idx = carry_and_segment_idx
         # Dynamically slice params for this segment from closed-over full_scan_in
