@@ -1372,6 +1372,9 @@ def scan(
         # Check for arrays including JAX tracers during tracing
         if hasattr(x, 'shape') and hasattr(x, 'reshape') and hasattr(x, 'ndim'):
           if x.ndim > 0:
+            # Check if already in segment format [num_segments, segment_length, ...]
+            if x.ndim >= 2 and x.shape[0] == num_segments and x.shape[1] == segment_length:
+              return x  # Already segmented, no reshape needed
             return x.reshape((num_segments, segment_length) + x.shape[1:])
         return x
 
