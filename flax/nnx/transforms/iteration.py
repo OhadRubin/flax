@@ -1385,7 +1385,7 @@ def scan(
         # Inner scan within segment - wrapped with remat for memory efficiency
         # prevent_cse=False is recommended when checkpoint is used inside scan
         # (see Linen's remat_scan implementation)
-        @jax.checkpoint(prevent_cse=False)
+        @functools.partial(jax.checkpoint, prevent_cse=False)
         def process_segment(c, seg_in):
           c_out, seg_out = jax.lax.scan(
             scan_fn, c, seg_in,
