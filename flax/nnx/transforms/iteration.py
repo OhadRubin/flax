@@ -1369,8 +1369,10 @@ def scan(
 
       # Reshape scan_in to add segment dimension: [length, ...] -> [num_segments, segment_length, ...]
       def reshape_for_segments(x):
-        if isinstance(x, jax.Array) and x.ndim > 0:
-          return x.reshape((num_segments, segment_length) + x.shape[1:])
+        # Check for arrays including JAX tracers during tracing
+        if hasattr(x, 'shape') and hasattr(x, 'reshape') and hasattr(x, 'ndim'):
+          if x.ndim > 0:
+            return x.reshape((num_segments, segment_length) + x.shape[1:])
         return x
 
       scan_in_segmented = jax.tree.map(reshape_for_segments, scan_in)
