@@ -1114,11 +1114,24 @@ class ScanFn:
       broadcast_deque_out,
       broadcast_arrays_out,
     )
-    scan_out = (
-      graphdefs_out,
-      pure_args_out,
-      pure_out,
-    )
+
+    # When output is only carry (out_axes=Carry), minimize scan_out to avoid
+    # stacking large arrays across iterations. The carry already contains
+    # all necessary state.
+    if self.output_carry_argnum == 'all':
+      # Return minimal structure - graphdefs still needed for final reconstruction
+      # but pure_args_out can be emptied since carry has the state
+      scan_out = (
+        graphdefs_out,
+        (),  # Don't stack args - carry has the state
+        None,  # pure_out is already None for Carry output
+      )
+    else:
+      scan_out = (
+        graphdefs_out,
+        pure_args_out,
+        pure_out,
+      )
     return carry_arg_out, scan_out
 
 
@@ -1130,7 +1143,6 @@ def scan(
   unroll: int | bool = 1,
   _split_transpose: bool = False,
   segment_length: int | None = None,
-  segment_broadcast_params: bool = True,
   # extended api
   in_axes: int | None | type[Carry] | tuple[tp.Any, ...] = (Carry, 0),
   out_axes: tp.Any = (Carry, 0),
@@ -1149,7 +1161,6 @@ def scan(
   unroll: int | bool = 1,
   _split_transpose: bool = False,
   segment_length: int | None = None,
-  segment_broadcast_params: bool = True,
   # extended api
   in_axes: int | None | type[Carry] | tuple[tp.Any, ...] = (Carry, 0),
   out_axes: tp.Any = (Carry, 0),
@@ -1167,7 +1178,6 @@ def scan(
   unroll: int | bool = 1,
   _split_transpose: bool = False,
   segment_length: int | None = None,
-  segment_broadcast_params: bool = True,
   # extended api
   in_axes: int | None | type[Carry] | tuple[tp.Any, ...] = (Carry, 0),
   out_axes: tp.Any = (Carry, 0),
@@ -1370,99 +1380,43 @@ def scan(
 
       num_segments = actual_length // segment_length
 
-      if segment_broadcast_params:
-        # BROADCAST APPROACH: Keep params closed-over, scan over indices
-        #
-        # KEY INSIGHT: To avoid parameter duplication, we keep the full scan_in
-        # (containing layer params) as a CLOSED-OVER variable. The outer scan
-        # only iterates over segment indices. Inside each segment, we use
-        # dynamic_slice to extract that segment's params from the closed-over
-        # full_scan_in.
-        #
-        # This is similar to Linen's variable_broadcast approach where params
-        # are accessed through closure rather than being sliced by scan.
+      # Reshape scan_in to [num_segments, segment_length, ...]
+      # and pass the reshaped params through the outer scan. Each segment
+      # gets its slice of params as an explicit input.
 
-        full_scan_in = scan_in
-        segment_indices = jnp.arange(num_segments)
+      def reshape_for_segments(x):
+        if hasattr(x, 'shape') and hasattr(x, 'reshape') and hasattr(x, 'ndim'):
+          if x.ndim > 0:
+            if x.ndim >= 2 and x.shape[0] == num_segments and x.shape[1] == segment_length:
+              return x  # Already segmented
+            return x.reshape((num_segments, segment_length) + x.shape[1:])
+        return x
 
-        def dynamic_slice_segment(tree, segment_idx):
-          """Dynamically slice a segment from the full pytree."""
-          start = segment_idx * segment_length
+      scan_in_segmented = jax.tree.map(reshape_for_segments, scan_in)
 
-          def slice_array(x):
-            if hasattr(x, 'shape') and hasattr(x, 'ndim') and x.ndim > 0:
-              start_indices = (start,) + (0,) * (x.ndim - 1)
-              slice_sizes = (segment_length,) + x.shape[1:]
-              return jax.lax.dynamic_slice(x, start_indices, slice_sizes)
-            return x
-
-          return jax.tree.map(slice_array, tree)
-
-        @functools.partial(jax.checkpoint, prevent_cse=False)
-        def process_segment_broadcast(carry_and_segment_idx):
-          c, segment_idx = carry_and_segment_idx
-          seg_in = dynamic_slice_segment(full_scan_in, segment_idx)
-          c_out, seg_out = jax.lax.scan(
-            scan_fn, c, seg_in,
-            length=segment_length,
-            reverse=reverse,
-            unroll=unroll,
-            _split_transpose=_split_transpose,
-          )
-          return c_out, seg_out
-
-        def outer_scan_fn_broadcast(carry, segment_idx):
-          carry_out, segment_out = process_segment_broadcast((carry, segment_idx))
-          return carry_out, segment_out
-
-        carry_out, scan_out_segments = jax.lax.scan(
-          outer_scan_fn_broadcast,
-          carry,
-          segment_indices,
-          length=num_segments,
+      # @functools.partial(jax.checkpoint, prevent_cse=False)
+      def process_segment(carry_and_scan_in):
+        c, seg_in = carry_and_scan_in
+        c_out, seg_out = jax.lax.scan(
+          scan_fn, c, seg_in,
+          length=segment_length,
           reverse=reverse,
+          unroll=unroll,
+          _split_transpose=_split_transpose,
         )
+        return c_out, seg_out
 
-      else:
-        # RESHAPE APPROACH: Reshape params and pass through outer scan
-        #
-        # This approach reshapes scan_in to [num_segments, segment_length, ...]
-        # and passes the reshaped params through the outer scan. Each segment
-        # gets its slice of params as an explicit input.
+      def outer_scan_fn(carry, segment_scan_in):
+        carry_out, segment_out = process_segment((carry, segment_scan_in))
+        return carry_out, segment_out
 
-        def reshape_for_segments(x):
-          if hasattr(x, 'shape') and hasattr(x, 'reshape') and hasattr(x, 'ndim'):
-            if x.ndim > 0:
-              if x.ndim >= 2 and x.shape[0] == num_segments and x.shape[1] == segment_length:
-                return x  # Already segmented
-              return x.reshape((num_segments, segment_length) + x.shape[1:])
-          return x
-
-        scan_in_segmented = jax.tree.map(reshape_for_segments, scan_in)
-
-        @functools.partial(jax.checkpoint, prevent_cse=False)
-        def process_segment_reshape(carry_and_scan_in):
-          c, seg_in = carry_and_scan_in
-          c_out, seg_out = jax.lax.scan(
-            scan_fn, c, seg_in,
-            length=segment_length,
-            reverse=reverse,
-            unroll=unroll,
-            _split_transpose=_split_transpose,
-          )
-          return c_out, seg_out
-
-        def outer_scan_fn_reshape(carry, segment_scan_in):
-          carry_out, segment_out = process_segment_reshape((carry, segment_scan_in))
-          return carry_out, segment_out
-
-        carry_out, scan_out_segments = jax.lax.scan(
-          outer_scan_fn_reshape,
-          carry,
-          scan_in_segmented,
-          length=num_segments,
-          reverse=reverse,
-        )
+      carry_out, scan_out_segments = jax.lax.scan(
+        outer_scan_fn,
+        carry,
+        scan_in_segmented,
+        length=num_segments,
+        reverse=reverse,
+      )
 
       # Stack segment outputs back to flat form
       def stack_segments(x):
