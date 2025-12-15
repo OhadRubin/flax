@@ -872,6 +872,7 @@ def scan(
   data_transform: Callable[..., Any] | None = None,
   metadata_params: dict[Any, Any] = {},
   check_constancy_invariants: bool = True,
+  segment_length: int | None = None,
 ) -> Callable[..., Any]:
   """A lifted version of ``jax.lax.scan``.
 
@@ -944,6 +945,11 @@ def scan(
       broadcast function (non-carry) outputs.  This requires an extra jax
       tracing step however, so setting to false can reduce trace time on larger
       models.
+    segment_length: optional integer specifying the segment size for memory-efficient
+      rematerialization. When provided, the scan is split into segments of this size,
+      with checkpointing at segment boundaries. This reduces memory usage from O(n) to
+      O(n/segment_length) for the backward pass, at the cost of recomputing each segment.
+      The total length must be divisible by segment_length.
 
   Returns:
     The scan function with the signature
@@ -991,17 +997,8 @@ def scan(
         for rng_group, split in zip(rng_groups, rng_splits)
     )
 
-    @functools.partial(
-        axes_scan.scan,
-        in_axes=(variable_in_axes, rng_axes, in_axes),
-        out_axes=(out_axes, variable_out_axes),
-        length=length,
-        reverse=reverse,
-        unroll=unroll,
-        _split_transpose=_split_transpose,
-        check_constancy_invariants=check_constancy_invariants,
-    )
-    def scanned(broadcast_vars, carry, scan_variable_groups, rng_groups, args):
+    # The core scan body function
+    def scan_body(broadcast_vars, carry, scan_variable_groups, rng_groups, args):
       carry_vars, c = carry
       variable_groups = (broadcast_vars, carry_vars) + scan_variable_groups
       if data_transform is not None:
@@ -1028,13 +1025,254 @@ def scan(
     new_scan_vars = []
     for scan_group, axis in zip(scan_vars, variable_in_axes):
       new_scan_vars.append(meta.remove_axis(scan_group, axis, metadata_params))
-    broadcast_vars, (carry_vars, c), (ys, scan_vars) = scanned(
-      broadcast_vars,
-      (carry_vars, init),
-      tuple(new_scan_vars),
-      rng_groups,
-      args,
-    )
+
+    if segment_length is not None:
+      # Segmented scan with rematerialization for memory efficiency
+      if d_length % segment_length != 0:
+        raise ValueError(
+          f'length ({d_length}) must be divisible by segment_length ({segment_length})'
+        )
+      num_segments = d_length // segment_length
+
+      # Helper to preserve sharding through reshape
+      def get_sharding_spec(x):
+        """Get PartitionSpec from array if available."""
+        if hasattr(x, 'aval') and hasattr(x.aval, 'sharding') and x.aval.sharding is not None:
+          return x.aval.sharding.spec
+        return None
+
+      def apply_segmented_sharding(x, orig_spec):
+        """Apply sharding constraint after reshape, inserting None for segment dim."""
+        if orig_spec is None:
+          return x
+        # Only apply if original spec length matches original array dims
+        # (after reshape, array has one more dim than orig_spec)
+        if len(orig_spec) != len(x.shape) - 1:
+          # Spec doesn't match expected structure, skip sharding constraint
+          return x
+        # Insert None at position 0 for the new segment dimension
+        # Original spec[0] moves to spec[1] (segment_length dim)
+        new_spec = jax.sharding.PartitionSpec(None, *orig_spec)
+        mesh = meta.get_global_mesh()
+        if mesh is not None:
+          sharding = jax.sharding.NamedSharding(mesh, new_spec)
+          return jax.lax.with_sharding_constraint(x, sharding)
+        return x
+
+      # Helper to reshape [length, ...] -> [num_segments, segment_length, ...]
+      def reshape_for_segments(x):
+        if hasattr(x, 'shape') and len(x.shape) > 0:
+          orig_spec = get_sharding_spec(x)
+          reshaped = x.reshape((num_segments, segment_length) + x.shape[1:])
+          return apply_segmented_sharding(reshaped, orig_spec)
+        return x
+
+      def reshape_var_group(var_group):
+        return jax.tree.map(reshape_for_segments, var_group)
+
+      # Reshape scan variables and rngs
+      segmented_scan_vars = tuple(reshape_var_group(v) for v in new_scan_vars)
+      segmented_rng_groups = tuple(
+        jax.tree.map(reshape_for_segments, rg) if split else rg
+        for rg, split in zip(rng_groups, rng_splits)
+      )
+
+      # Reshape scanned args and keep track of which are broadcast
+      def reshape_arg(in_ax, arg):
+        if in_ax is axes_scan.broadcast:
+          return arg  # Keep as-is for broadcast
+        def reshape_with_axis(x):
+          if not hasattr(x, 'shape') or len(x.shape) <= in_ax:
+            return x
+          if x.shape[in_ax] != d_length:
+            return x
+          orig_spec = get_sharding_spec(x)
+          # Move scan axis to front, then reshape
+          perm = [in_ax] + [i for i in range(len(x.shape)) if i != in_ax]
+          x_t = jax.numpy.transpose(x, perm)
+          reshaped = x_t.reshape((num_segments, segment_length) + x_t.shape[1:])
+          return apply_segmented_sharding(reshaped, orig_spec)
+        return jax.tree.map(reshape_with_axis, arg)
+
+      reshaped_args = jax.tree.map(reshape_arg, in_axes, args)
+
+      # Collect scanned args - replace broadcast args with () so they have no leaves when flattened
+      # This follows the same pattern as axes_scan.scan
+      def make_scanned_args(in_ax, reshaped_arg):
+        if in_ax is axes_scan.broadcast:
+          return ()  # Empty tuple has no leaves when flattened
+        return reshaped_arg
+
+      scanned_args_tree = jax.tree.map(make_scanned_args, in_axes, reshaped_args)
+      scanned_args_list = jax.tree.leaves(scanned_args_tree)  # Only scanned args remain
+
+      # Inner scan axes (segment axis is now at position 0 for scanned args)
+      inner_in_axes = jax.tree.map(
+        lambda ax: axes_scan.broadcast if ax is axes_scan.broadcast else 0,
+        in_axes
+      )
+      inner_out_axes = jax.tree.map(
+        lambda ax: axes_scan.broadcast if ax is axes_scan.broadcast else 0,
+        out_axes
+      )
+
+      # Create inner scan function
+      inner_scan_fn = axes_scan.scan(
+        lambda bv, c, sv, rg, a: scan_body(bv, c, sv, rg, a),
+        in_axes=(variable_in_axes, rng_axes, inner_in_axes),
+        out_axes=(inner_out_axes, variable_out_axes),
+        length=segment_length,
+        reverse=reverse,
+        unroll=unroll,
+        _split_transpose=_split_transpose,
+        check_constancy_invariants=False,
+      )
+
+      # Flatten everything to lists of arrays, filter out empty structures
+      # This avoids issues with empty dicts {} being leaves without .shape
+
+      # Flatten vars - collect all arrays and their paths for reconstruction
+      flat_vars_list = []
+      vars_treedef = []
+      for vg in segmented_scan_vars:
+        flat, tdef = jax.tree.flatten(vg)
+        flat_vars_list.extend(flat)
+        vars_treedef.append((tdef, len(flat)))
+
+      # Flatten rngs
+      flat_rngs_list = []
+      rngs_treedef = []
+      for i, (rg, split) in enumerate(zip(segmented_rng_groups, rng_splits)):
+        if split:
+          flat, tdef = jax.tree.flatten(rg)
+          flat_rngs_list.extend(flat)
+          rngs_treedef.append((i, tdef, len(flat)))
+
+      # Combine all arrays into single flat list for scan
+      all_arrays = flat_vars_list + flat_rngs_list + scanned_args_list
+      n_scanned_args = len(scanned_args_list)
+
+      assert all(hasattr(x, 'shape') and len(x.shape) > 0 for x in all_arrays), (
+        f"All arrays must have shape with at least 1 dim. Got shapes: {[getattr(x, 'shape', None) for x in all_arrays]}"
+      )
+
+      # Get non-split rng groups for reconstruction
+      non_split_rngs = tuple(
+        rg if not split else None
+        for rg, split in zip(rng_groups, rng_splits)
+      )
+
+      # Store the treedef of scanned_args_tree for reconstruction
+      _, scanned_args_treedef = jax.tree.flatten(scanned_args_tree)
+
+      # Rebuild process_segment to work with flat arrays
+      def make_process_segment_flat(vars_td, rngs_td, orig_rng_groups, n_args,
+                                    orig_in_axes, orig_args, scanned_treedef):
+        @functools.partial(jax.checkpoint, prevent_cse=False)
+        def process_segment(carry, flat_arrays):
+          bcast, inner_carry = carry
+
+          # Split flat_arrays back into vars, rngs, args
+          idx = 0
+          seg_vars = []
+          for tdef, count in vars_td:
+            seg_vars.append(jax.tree.unflatten(tdef, flat_arrays[idx:idx+count]))
+            idx += count
+          seg_vars = tuple(seg_vars)
+
+          # Reconstruct rngs
+          seg_rngs_list = list(orig_rng_groups)  # Start with original (non-split)
+          for rng_idx, tdef, count in rngs_td:
+            seg_rngs_list[rng_idx] = jax.tree.unflatten(tdef, flat_arrays[idx:idx+count])
+            idx += count
+          seg_rngs = tuple(seg_rngs_list)
+
+          # Reconstruct args using tree_map (like axes_scan does)
+          seg_scanned_args = flat_arrays[idx:idx+n_args]
+          assert len(seg_scanned_args) == n_args, (
+            f"Expected {n_args} scanned args, got {len(seg_scanned_args)}. "
+            f"len(flat_arrays)={len(flat_arrays)}, idx={idx}"
+          )
+          # Unflatten to get tree with () for broadcast positions
+          scanned_tree = jax.tree.unflatten(scanned_treedef, seg_scanned_args)
+          # Combine with original args: use original for broadcast, scanned for others
+          seg_args = jax.tree.map(
+            lambda ax, orig, scanned: orig if ax is axes_scan.broadcast else scanned,
+            orig_in_axes, orig_args, scanned_tree
+          )
+
+          bcast_out, carry_out, (ys, svars) = inner_scan_fn(
+            bcast, inner_carry, seg_vars, seg_rngs, seg_args
+          )
+          return (bcast_out, carry_out), (ys, svars)
+        return process_segment
+
+      process_segment = make_process_segment_flat(
+        vars_treedef, rngs_treedef, non_split_rngs, n_scanned_args,
+        in_axes, args, scanned_args_treedef
+      )
+
+      # Stack all arrays - each has shape [num_segments, ...]
+      outer_xs = all_arrays  # List of arrays
+      outer_init = (broadcast_vars, (carry_vars, init))
+
+      (broadcast_vars, (carry_vars, c)), (ys_seg, scan_vars_seg) = jax.lax.scan(
+        process_segment, outer_init, outer_xs,
+        length=num_segments, reverse=reverse, unroll=1
+      )
+
+      # Reshape outputs back: [num_segments, segment_length, ...] -> [length, ...]
+      def restore_sharding(x, orig_spec):
+        """Restore original sharding after unreshape (remove the segment dim's None)."""
+        if orig_spec is None:
+          return x
+        # orig_spec is (None, actual_spec...) - remove the leading None
+        if len(orig_spec) > 0 and orig_spec[0] is None:
+          restored_spec = jax.sharding.PartitionSpec(*orig_spec[1:])
+        else:
+          restored_spec = orig_spec
+        # Only apply if restored spec length matches array dims
+        if len(restored_spec) != len(x.shape):
+          return x
+        mesh = meta.get_global_mesh()
+        if mesh is not None:
+          sharding = jax.sharding.NamedSharding(mesh, restored_spec)
+          return jax.lax.with_sharding_constraint(x, sharding)
+        return x
+
+      def unreshape(x):
+        if hasattr(x, 'shape') and len(x.shape) >= 2:
+          if x.shape[0] == num_segments and x.shape[1] == segment_length:
+            orig_spec = get_sharding_spec(x)
+            reshaped = x.reshape((d_length,) + x.shape[2:])
+            return restore_sharding(reshaped, orig_spec)
+        return x
+
+      ys = jax.tree.map(unreshape, ys_seg)
+      scan_vars = tuple(jax.tree.map(unreshape, v) for v in scan_vars_seg)
+
+    else:
+      # Standard non-segmented scan
+      @functools.partial(
+          axes_scan.scan,
+          in_axes=(variable_in_axes, rng_axes, in_axes),
+          out_axes=(out_axes, variable_out_axes),
+          length=length,
+          reverse=reverse,
+          unroll=unroll,
+          _split_transpose=_split_transpose,
+          check_constancy_invariants=check_constancy_invariants,
+      )
+      def scanned(broadcast_vars, carry, scan_variable_groups, rng_groups, args):
+        return scan_body(broadcast_vars, carry, scan_variable_groups, rng_groups, args)
+
+      broadcast_vars, (carry_vars, c), (ys, scan_vars) = scanned(
+        broadcast_vars,
+        (carry_vars, init),
+        tuple(new_scan_vars),
+        rng_groups,
+        args,
+      )
     new_scan_vars = []
     for scan_group, axis in zip(scan_vars, variable_out_axes):
       new_scan_vars.append(meta.add_axis(scan_group, axis, metadata_params))
@@ -1458,9 +1696,18 @@ def checkpoint(
     # add 2 to each static_argnums because we add two initial arguments to rematted
     static_argnums_ = jax.tree_util.tree_map(lambda x: x + 2, static_argnums)
 
+    # After JAX v0.3.16, concrete=False is a no-op and concrete=True raises
+    # NotImplementedError. Starting in JAX v0.8.2, the concrete argument is
+    # deprecated and will be removed in the future.
+    if concrete:
+      raise NotImplementedError(
+          "The concrete argument is deprecated. Use static_argnums instead."
+          " for more information, see"
+          " https://docs.jax.dev/en/latest/jep/11830-new-remat-checkpoint.html"
+      )
+
     @functools.partial(
       jax.remat,
-      concrete=concrete,
       static_argnums=static_argnums_,
       prevent_cse=prevent_cse,
       policy=policy,

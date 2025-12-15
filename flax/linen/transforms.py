@@ -1166,6 +1166,7 @@ def scan(
   methods=None,
   _split_transpose: bool = False,
   check_constancy_invariants: bool = True,
+  segment_length: int | None = None,
 ) -> Target:
   """A lifted version of ``jax.lax.scan``.
 
@@ -1310,6 +1311,12 @@ def scan(
       broadcast function (non-carry) outputs.  This requires an extra jax
       tracing step however, so setting to false can reduce trace time on larger
       models.
+    segment_length: optional integer specifying the segment size for memory-efficient
+      rematerialization. When provided, the scan is split into segments of this size,
+      with checkpointing at segment boundaries. This reduces memory usage from O(n) to
+      O(n/segment_length) for the backward pass, at the cost of recomputing each segment.
+      The total length must be divisible by segment_length. For example, with 48 layers
+      and segment_length=8, only 6 segment boundary states are saved instead of 48.
 
   Returns:
     The scan function with the signature ``(module, carry, *xs) -> (carry,
@@ -1333,6 +1340,7 @@ def scan(
     metadata_params=metadata_params,
     methods=methods,
     check_constancy_invariants=check_constancy_invariants,
+    segment_length=segment_length,
   )
 
 
